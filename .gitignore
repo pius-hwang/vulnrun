@@ -4,3 +4,6 @@ SECRET.txt
 files/
 __pycache__/
 *.pyc
+*.log
+PWNED.txt
+toctou_request.txt
