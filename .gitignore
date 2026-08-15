@@ -1,4 +1,5 @@
 # 실행 시 자동 생성되는 런타임 산출물 (커밋 대상 아님)
+.progress.json
 *.db
 SECRET.txt
 files/
