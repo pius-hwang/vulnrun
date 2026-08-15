@@ -20,6 +20,7 @@ import base64
 import hashlib
 import html
 import os
+import re
 import socket
 import sqlite3
 import urllib.parse
@@ -124,6 +125,41 @@ def page(title, body):
 <title>{title}</title>{CSS}</head><body>{NAV}{body}</body></html>""".encode("utf-8")
 
 
+LEVELS = ["low", "medium", "high", "secure"]
+
+
+def level_selector(current):
+    """방어 강도 셀렉터 UI. 링크는 ?level=X (경로 유지). 폼에는 hidden 필드로 함께 실린다."""
+    links = " · ".join(
+        f'<b class="flag">{lv}</b>' if lv == current else f'<a href="?level={lv}">{lv}</a>'
+        for lv in LEVELS
+    )
+    desc = {
+        "low": "무방비 — 입력을 그대로 출력",
+        "medium": "어설픈 방어(1회 블랙리스트) — 겹쳐쓰기 우회 가능",
+        "high": "강한 방어(재귀 블랙리스트) — 미차단 핸들러로 우회 가능",
+        "secure": "완전 방어(출력 이스케이프)",
+    }[current]
+    return (f'<div class="card">🎚️ <b>방어 레벨:</b> {links}'
+            f'<br><span style="color:#9aa4b2">현재: <b>{current}</b> — {desc}</span></div>')
+
+
+def _xss_executes(rendered):
+    """렌더된 사용자 입력에 '실행 가능한' 미이스케이프 벡터가 남았는지 판별한다.
+    (이벤트 핸들러가 붙은 태그 또는 <script>. 성공 판정용 🎉 마커의 근거.)"""
+    return bool(re.search(r"<[a-z][^>]*\son\w+\s*=", rendered, re.I)) or "<script" in rendered.lower()
+
+
+def _filter_recursive(s, blocked):
+    """차단 문자열을 더 이상 바뀌지 않을 때까지 반복 제거(겹쳐쓰기 우회 차단)."""
+    prev = None
+    while prev != s:
+        prev = s
+        for bad in blocked:
+            s = s.replace(bad, "").replace(bad.upper(), "").replace(bad.capitalize(), "")
+    return s
+
+
 # --------------------------------------------------------------------------
 def view_home():
     body = """
@@ -210,15 +246,29 @@ def naive_filter(s):
 
 
 def view_profile(params):
+    level = (params.get("level") or ["low"])[0]
+    if level not in LEVELS:
+        level = "low"
     bio = params.get("bio", [""])[0]
     rendered = ""
     if bio:
-        safe_ish = naive_filter(bio)
-        rendered = f"<div class='card'>내 소개: {safe_ish}</div>"
+        if level == "low":
+            shown = bio                              # 무방비: 그대로 출력
+        elif level == "medium":
+            shown = naive_filter(bio)                # 1회 블랙리스트 → 겹쳐쓰기로 우회
+        elif level == "high":
+            shown = _filter_recursive(bio, BLOCKED)  # 재귀 블랙리스트 → 미차단 핸들러로 우회
+        else:  # secure
+            shown = html.escape(bio)                 # 출력 이스케이프 → 실행 불가
+        marker = ('<p class="flag">🎉 필터를 우회한 실행 가능한 페이로드가 그대로 반영되었습니다!</p>'
+                  if _xss_executes(shown) else "")
+        rendered = f"<div class='card'>내 소개: {shown}{marker}</div>"
     body = f"""
     <h1>2. XSS 필터 우회</h1>
+    {level_selector(level)}
     <div class="card">
       <form method="get">
+        <input type="hidden" name="level" value="{html.escape(level)}">
         <label>자기소개 (일부 태그는 차단됩니다)</label>
         <input name="bio" value="{html.escape(bio)}">
         <button>미리보기</button>
@@ -234,11 +284,16 @@ def view_profile(params):
       <code>&lt;scr&lt;script&gt;ipt&gt;</code> 처럼 겹쳐 쓰면 지운 뒤 오히려 완성됩니다.</div>
     <div class="hint">💡 힌트 2: 차단 안 된 이벤트 핸들러도 많습니다
       (<code>onmouseover</code>, <code>onfocus autofocus</code> 등).</div>
-    <details><summary>정답 보기</summary>
-      <p>겹쳐쓰기: <code>&lt;img src=x oneonerrorrror="console.log('xss')"&gt;</code>
-      → 필터가 가운데 <code>onerror</code>를 지우면 바깥이 <code>onerror</code>로 합쳐집니다.</p>
-      <p>대체 핸들러: <code>&lt;svg onfocus="console.log(1)" autofocus tabindex=0&gt;</code>
-      (<code>onload</code>는 막혔지만 <code>onfocus</code>는 안 막힘)</p>
+    <details><summary>정답 보기 (레벨별)</summary>
+      <p><b>low</b> — 필터가 없습니다. <code>&lt;img src=x onerror="console.log('xss')"&gt;</code> 가 그대로 실행됩니다.</p>
+      <p><b>medium</b> — 블랙리스트를 <b>한 번만</b> 적용합니다. 겹쳐쓰기로 우회:
+      <code>&lt;img src=x oneonerrorrror="console.log('xss')"&gt;</code>
+      → 가운데 <code>onerror</code>를 지우면 바깥이 <code>onerror</code>로 합쳐집니다.</p>
+      <p><b>high</b> — 블랙리스트를 <b>재귀</b> 적용해 겹쳐쓰기는 막힙니다. 하지만 차단 목록에 없는
+      핸들러로 우회: <code>&lt;svg onfocus="console.log(1)" autofocus tabindex=0&gt;</code>
+      (<code>onload</code>는 막혔지만 <code>onfocus</code>는 안 막힘). <b>블랙리스트는 언제나 빈틈이 있습니다.</b></p>
+      <p><b>secure</b> — 출력 이스케이프(<code>html.escape</code>)라 <code>&lt;</code> 가 <code>&amp;lt;</code> 로 바뀌어
+      어떤 태그도 실행되지 않습니다.</p>
     </details>
     <div class="card"><b>🛡️ 방어:</b> 블랙리스트는 항상 뚫립니다.
       <b>출력 이스케이프(화이트리스트)</b> + <code>Content-Security-Policy</code>를 쓰세요.</div>

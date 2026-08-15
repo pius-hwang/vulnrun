@@ -13,6 +13,7 @@ DVWA-스타일 의도적 취약 웹앱 (교육용, localhost 전용).
 import html
 import http.cookies
 import os
+import re
 import sqlite3
 import subprocess
 import urllib.parse
@@ -97,6 +98,25 @@ def page(title, body):
 <title>{title}</title>{CSS}</head><body>{NAV}{body}</body></html>""".encode("utf-8")
 
 
+LEVELS = ["low", "medium", "high", "secure"]
+
+
+def level_selector(current):
+    """방어 강도 셀렉터 UI. 링크는 ?level=X (경로 유지). 폼에는 hidden 필드로 함께 실린다."""
+    links = " · ".join(
+        f'<b class="flag">{lv}</b>' if lv == current else f'<a href="?level={lv}">{lv}</a>'
+        for lv in LEVELS
+    )
+    desc = {
+        "low": "무방비 — 입력을 그대로 신뢰",
+        "medium": "어설픈 방어(블랙리스트) — 알려진 우회 존재",
+        "high": "강한 방어(입력 검증/화이트리스트)",
+        "secure": "완전 방어(파라미터 바인딩)",
+    }[current]
+    return (f'<div class="card">🎚️ <b>방어 레벨:</b> {links}'
+            f'<br><span style="color:#9aa4b2">현재: <b>{current}</b> — {desc}</span></div>')
+
+
 # --------------------------------------------------------------------------
 # 각 챌린지 페이지
 # --------------------------------------------------------------------------
@@ -126,36 +146,60 @@ def view_home():
 
 # 1) SQL Injection ----------------------------------------------------------
 def view_login(params, method, body_params, headers):
+    level = (body_params.get("level") or params.get("level") or ["low"])[0]
+    if level not in LEVELS:
+        level = "low"
     msg = ""
     if method == "POST":
         u = body_params.get("username", [""])[0]
         p = body_params.get("password", [""])[0]
-        # 취약: 사용자 입력을 문자열로 직접 SQL에 이어붙임
-        query = f"SELECT username, secret FROM users WHERE username='{u}' AND password='{p}'"
+        query = None
         con = db()
+        rows = []
         try:
-            rows = con.execute(query).fetchall()
+            if level == "low":
+                # 취약: 사용자 입력을 문자열로 직접 SQL에 이어붙임
+                query = f"SELECT username, secret FROM users WHERE username='{u}' AND password='{p}'"
+                rows = con.execute(query).fetchall()
+            elif level == "medium":
+                # 어설픈 방어: '--' 주석만 제거하는 블랙리스트. OR 기반 주입은 그대로 통과.
+                fu, fp = u.replace("--", ""), p.replace("--", "")
+                query = f"SELECT username, secret FROM users WHERE username='{fu}' AND password='{fp}'"
+                rows = con.execute(query).fetchall()
+            elif level == "high":
+                # 강한 방어: 화이트리스트 입력 검증. 메타문자가 있으면 아예 거부.
+                if re.fullmatch(r"[A-Za-z0-9_]*", u) and re.fullmatch(r"[A-Za-z0-9_]*", p):
+                    query = f"SELECT username, secret FROM users WHERE username='{u}' AND password='{p}'"
+                    rows = con.execute(query).fetchall()
+                else:
+                    query = "(거부됨: 허용되지 않는 문자)"
+                    msg = '<div class="warn">❌ 아이디/비밀번호에 허용되지 않는 문자가 있습니다.</div>'
+            else:  # secure
+                # 완전 방어: 파라미터 바인딩. 입력은 값으로만 취급된다.
+                query = "SELECT username, secret FROM users WHERE username=? AND password=?"
+                rows = con.execute(query, (u, p)).fetchall()
         except Exception as e:
             rows = []
             msg = f'<div class="warn">SQL 오류: {html.escape(str(e))}</div>'
         con.close()
         if rows:
-            name = rows[0][0]
-            secret = rows[0][1]
             flag = ""
-            if name == "admin" or any(r[0] == "admin" for r in rows):
+            if any(r[0] == "admin" for r in rows):
                 flag = '<p class="flag">🎉 FLAG{admin_only_secret} 획득! admin secret을 읽었습니다.</p>'
             secrets = "<br>".join(f"{html.escape(str(r[0]))}: {html.escape(str(r[1]))}" for r in rows)
             msg = f'<div class="card">✅ 로그인/조회 성공:<br>{secrets}{flag}</div>'
         elif not msg:
             msg = '<div class="warn">❌ 로그인 실패</div>'
         # 디버그: 실제 실행된 쿼리를 노출 (학습 편의)
-        msg += f"<p>실행된 쿼리:</p><pre>{html.escape(query)}</pre>"
+        if query is not None:
+            msg += f"<p>실행된 쿼리:</p><pre>{html.escape(query)}</pre>"
 
     body = f"""
     <h1>1. SQL Injection — 로그인 우회</h1>
+    {level_selector(level)}
     <div class="card">
       <form method="post">
+        <input type="hidden" name="level" value="{html.escape(level)}">
         <label>아이디</label><input name="username" autofocus>
         <label>비밀번호</label><input name="password" type="text">
         <button>로그인</button>
@@ -165,11 +209,16 @@ def view_login(params, method, body_params, headers):
     <p><b>🎯 목표:</b> admin의 비밀번호를 모른 채, admin으로 로그인해 FLAG를 읽으세요.</p>
     <div class="hint">💡 힌트 1: 아이디 칸에 작은따옴표 <code>'</code> 하나만 넣어보세요. 오류 메시지가 뭘 알려주나요?</div>
     <div class="hint">💡 힌트 2: SQL의 <code>WHERE</code> 조건을 항상 참으로 만들거나, 조건을 <code>--</code>로 주석 처리해 없앨 수 있습니다.</div>
-    <details><summary>정답 보기</summary>
-      <p>아이디 칸에: <code>admin'--</code> (비밀번호는 아무거나)<br>
-      또는 아이디: <code>' OR '1'='1' --</code></p>
-      <p>실행 쿼리가 <code>... WHERE username='admin'--' AND password='...'</code> 가 되어
-      비밀번호 조건이 주석 처리됩니다.</p>
+    <details><summary>정답 보기 (레벨별)</summary>
+      <p><b>low</b> — 아이디 칸에 <code>admin'--</code> (비밀번호 아무거나). 쿼리가
+      <code>... WHERE username='admin'--' AND password='...'</code> 가 되어 비밀번호 조건이 주석 처리됩니다.</p>
+      <p><b>medium</b> — 필터가 <code>--</code> 를 지우므로 주석 payload 는 막힙니다. 하지만 주석 없이
+      우회할 수 있습니다: 아이디 <code>admin</code>, 비밀번호 <code>' OR '1'='1</code>.
+      쿼리가 <code>... password='' OR '1'='1'</code> 로 항상 참이 되어 admin 행이 반환됩니다.
+      <b>블랙리스트는 한 가지 표현만 막을 뿐, 같은 목적의 다른 표현은 통과시킵니다.</b></p>
+      <p><b>high</b> — 영숫자·<code>_</code> 만 허용하는 화이트리스트 검증이라 <code>'</code> 자체가 거부됩니다.
+      이 로그인 폼에서는 주입 불가.</p>
+      <p><b>secure</b> — 파라미터 바인딩. 입력이 값으로만 취급되어 주입이 불가능합니다.</p>
     </details>
     <div class="card"><b>🛡️ 방어:</b> 문자열 연결 대신 <b>파라미터 바인딩(prepared statement)</b>을 쓰세요.
       <pre>con.execute("SELECT ... WHERE username=? AND password=?", (u, p))</pre>
